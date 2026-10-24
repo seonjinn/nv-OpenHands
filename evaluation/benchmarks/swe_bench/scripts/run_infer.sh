@@ -178,9 +178,24 @@ if [ -n "$EVAL_CONDENSER" ]; then
   EVAL_NOTE="${EVAL_NOTE}-${EVAL_CONDENSER}"
 fi
 
+# `poetry run` spends about 1 s per rollout to resolve the project venv. When the
+# caller already exports VIRTUAL_ENV, start its python directly with the same
+# environment that `poetry run` sets up.
+PYTHON_CMD="poetry run python"
+if [[ "${OH_DIRECT_VENV_PYTHON,,}" = "true" || "$OH_DIRECT_VENV_PYTHON" = "1" ]]; then
+  if [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    export PATH="$VIRTUAL_ENV/bin:$PATH"
+    unset PYTHONHOME __PYVENV_LAUNCHER__
+    PYTHON_CMD="$VIRTUAL_ENV/bin/python"
+  else
+    echo "OH_DIRECT_VENV_PYTHON is set but VIRTUAL_ENV has no python, use poetry run"
+  fi
+fi
+echo "PYTHON_CMD: $PYTHON_CMD"
+
 function run_eval() {
   local eval_note="${1}"
-  COMMAND="poetry run python evaluation/benchmarks/swe_bench/run_infer.py \
+  COMMAND="$PYTHON_CMD evaluation/benchmarks/swe_bench/run_infer.py \
     --agent-cls $AGENT \
     --llm-config $MODEL_CONFIG \
     --max-iterations $MAX_ITER \

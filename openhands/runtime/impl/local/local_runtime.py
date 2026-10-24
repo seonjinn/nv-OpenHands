@@ -66,6 +66,10 @@ _RUNNING_SERVERS: dict[str, ActionExecutionServerInfo] = {}
 # Global list to track warm servers waiting for use
 _WARM_SERVERS: list[ActionExecutionServerInfo] = []
 
+# Poll interval for the server /alive check. A finer interval cuts the idle wait
+# between server readiness and the next poll, up to the full interval per start.
+_ALIVE_POLL_INTERVAL_S = float(os.getenv('OH_RUNTIME_ALIVE_POLL_S', '2'))
+
 
 def get_user_info() -> tuple[int, str | None]:
     """Get user ID and username in a cross-platform way."""
@@ -413,7 +417,7 @@ class LocalRuntime(ActionExecutionClient):
                 _create_warm_server(config, plugins)
 
     @tenacity.retry(
-        wait=tenacity.wait_fixed(2),
+        wait=tenacity.wait_fixed(_ALIVE_POLL_INTERVAL_S),
         stop=tenacity.stop_after_delay(300) | stop_if_should_exit(),
         before_sleep=lambda retry_state: logger.debug(
             f'Waiting for server to be ready... (attempt {retry_state.attempt_number})'
@@ -774,7 +778,7 @@ def _create_warm_server(
 
         # Use tenacity to retry the connection
         @tenacity.retry(
-            wait=tenacity.wait_fixed(2),
+            wait=tenacity.wait_fixed(_ALIVE_POLL_INTERVAL_S),
             stop=tenacity.stop_after_delay(120) | stop_if_should_exit(),
             before_sleep=lambda retry_state: logger.debug(
                 f'Waiting for warm server to be ready... (attempt {retry_state.attempt_number})'

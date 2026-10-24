@@ -73,6 +73,7 @@ from openhands.utils.shutdown_listener import sleep_if_should_continue
 from evaluation.benchmarks.swe_bench.replay_utils import messages_to_replay_events  # noqa: E402
 
 USE_HINT_TEXT = os.environ.get('USE_HINT_TEXT', 'false').lower() == 'true'
+FAST_DEEP_RESET = os.environ.get('OH_FAST_DEEP_RESET', 'false').lower() in ('true', '1')
 RUN_WITH_BROWSING = os.environ.get('RUN_WITH_BROWSING', 'false').lower() == 'true'
 ENABLE_BROWSER_FOR_SWEBENCH = os.environ.get('ENABLE_BROWSER_FOR_SWEBENCH', 'false').lower() == 'true'
 ENABLE_LLM_EDITOR = os.environ.get('ENABLE_LLM_EDITOR', 'false').lower() == 'true'
@@ -795,7 +796,50 @@ def _interrupt_stuck_command(runtime: Runtime) -> None:
 
 
 
+def _fast_deep_reset_cmd(base_commit: str) -> str:
+    """Build one command with the end state of the deep reset plus steps 4 and 5.
+
+    One `for-each-ref --contains` walk finds the refs past base, so no ref
+    starts its own `merge-base` process. Reflog expiry and gc run once, after
+    the final checkout. The default path repacks three times and expires the
+    reflogs twice. The subshell keeps ref names out of the agent shell, and the
+    classification runs before the first write so that a failure there leaves
+    the repo as it was for the default path.
+    """
+    return (
+        '( set -o pipefail && '
+        f'BASE=$(git rev-parse --verify {base_commit}^{{commit}}) && '
+        'ORIG_BRANCH=$(git symbolic-ref --short -q HEAD || echo main) && '
+        # A ref is past base when its peeled tip contains BASE but is not BASE.
+        # Reset such local branches to BASE and delete the other such refs.
+        # Symbolic refs are skipped because their targets are classified too.
+        'REF_UPDATES=$(git for-each-ref --contains "$BASE" --format="%(refname) %(symref)" refs '
+        "| awk 'NF == 1 {print $1 \"^{commit} \" $1}' "
+        '| git cat-file --batch-check="%(objectname) %(rest)" '
+        "| awk -v base=\"$BASE\" '$1 != base {if ($2 ~ /^refs\\/heads\\//) "
+        "print \"update \" $2 \" \" base; else print \"delete \" $2}') && "
+        'git checkout --detach "$BASE" && '
+        '{ [ -z "$REF_UPDATES" ] || printf "%s\\n" "$REF_UPDATES" | git update-ref --stdin; } && '
+        'git_dir=$(git rev-parse --git-dir) && '
+        'rm -f "$git_dir"/FETCH_HEAD "$git_dir"/ORIG_HEAD '
+        '"$git_dir"/MERGE_HEAD "$git_dir"/CHERRY_PICK_HEAD '
+        '"$git_dir"/REVERT_HEAD "$git_dir"/BISECT_HEAD '
+        '"$git_dir"/AUTO_MERGE && '
+        'git checkout -B "$ORIG_BRANCH" "$BASE" && '
+        'git reflog expire --expire=now --expire-unreachable=now --all && '
+        'git gc --prune=now )'
+    )
+
+
 def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
+    start_time = time.time()
+    try:
+        _deep_reset_to_base_commit_impl(runtime, base_commit)
+    finally:
+        update_metrics({'deep_reset_time': time.time() - start_time})
+
+
+def _deep_reset_to_base_commit_impl(runtime: Runtime, base_commit: str) -> None:
     # 2) Remove all remotes so remote-tracking refs can no longer resolve.
     action = CmdRunAction(
         command='for remote_name in $(git remote); do git remote remove "${remote_name}"; done'
@@ -887,6 +931,18 @@ def _deep_reset_to_base_commit(runtime: Runtime, base_commit: str) -> None:
         'echo "Local branches were preserved." && '
         'echo "Tags/remotes/other refs after base were deleted."'
     )
+
+    if FAST_DEEP_RESET:
+        action = CmdRunAction(command=_fast_deep_reset_cmd(base_commit))
+        action.set_hard_timeout(600)
+        logger.info(action, extra={'msg_type': 'ACTION'})
+        obs = _run_harness_action(runtime, action)
+        logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+        if obs.exit_code == 0:
+            return
+        # Fall back to the default path, which also cleans up a partial run.
+        if obs.exit_code == -1:
+            _interrupt_stuck_command(runtime)
 
     action = CmdRunAction(command=deep_reset_cmd)
     action.set_hard_timeout(600)
@@ -1692,13 +1748,17 @@ def process_instance(
             )
         else:
             complete_runtime_fn = complete_runtime
+        start_time = time.perf_counter()
         return_val = complete_runtime_fn(runtime, instance)
+        update_metrics({'complete_runtime_time': time.perf_counter() - start_time})
         git_patch = return_val['git_patch']
         logger.info(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
         )
     finally:
+        start_time = time.perf_counter()
         runtime.close()
+        update_metrics({'close_runtime_time': time.perf_counter() - start_time})
         # _cleanup_eval_sessions(eval_sessions_dir, pre_existing_sessions)
     # ==========================================
 
