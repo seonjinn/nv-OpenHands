@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+from collections.abc import Mapping
 from typing import Any, Dict, Literal, Optional
 import time
 import pandas as pd
@@ -162,18 +164,25 @@ def update_metrics(update_dict: Dict[str, Any]) -> None:
     existing_dict = {k: v for k, v in existing_dict.items() if v is not None}
     update_dict = {k: v for k, v in update_dict.items() if v is not None}
 
-    with open(metrics_fpath, "w") as f:
+    # Gym reads this file while the agent runs. Replace it atomically so a reader never
+    # sees a partial write. Gym serializes its own writes with a separate lockdir.
+    tmp_fpath = f'{metrics_fpath}.tmp.{os.getpid()}'
+    with open(tmp_fpath, 'w') as f:
         json.dump(existing_dict | update_dict, f)
+    os.replace(tmp_fpath, metrics_fpath)
 
 
-RELEASE_SIGNAL_POLL_S = 0.5
+RELEASE_SIGNAL_POLL_S = float(os.environ.get('OH_RELEASE_SIGNAL_POLL_S', '0.5'))
+PREWARM_TIMEOUT_EXIT_CODE = 124  # Same code as the cold-path shell `timeout` kill.
+PREWARM_SHUTDOWN_EXIT_CODE = 143  # 128 + SIGTERM.
 
 
-def wait_for_release_signal(signal_fpath: str) -> tuple[bool, float]:
+def wait_for_release_signal(signal_fpath: str) -> tuple[str, float]:
     """Hold a prewarmed rollout until NeMo Gym releases or cancels it.
 
     Gym writes "release" or "cancel" atomically. A missing file means keep waiting.
-    A shutdown signal counts as cancel. Returns (released, wait_s).
+    Returns (outcome, wait_s). The outcome is "release", "cancel", or "shutdown" when
+    a shutdown signal ends the hold first.
     """
     start_time = time.perf_counter()
     while should_continue():
@@ -183,9 +192,49 @@ def wait_for_release_signal(signal_fpath: str) -> tuple[bool, float]:
         except FileNotFoundError:
             signal = ''
         if signal in ('release', 'cancel'):
-            return signal == 'release', time.perf_counter() - start_time
+            return signal, time.perf_counter() - start_time
         time.sleep(RELEASE_SIGNAL_POLL_S)
-    return False, time.perf_counter() - start_time
+    return 'shutdown', time.perf_counter() - start_time
+
+
+def release_deadline_epoch(
+    env: Mapping[str, str], release_wait_s: float
+) -> float | None:
+    """Return the epoch at which a released prewarm reaches the cold-path agent budget.
+
+    The outer shell `timeout` starts at OH_TIMEOUT_START_EPOCH. Its limit includes the
+    prewarm TTL, so it does not enforce the agent budget OH_AGENT_TIMEOUT_S. A cold run
+    is killed at start + budget. A held run gets the same budget shifted by the hold.
+    Returns None when either variable is absent or not a number.
+    """
+    try:
+        start_epoch = float(env['OH_TIMEOUT_START_EPOCH'])
+        agent_timeout_s = float(env['OH_AGENT_TIMEOUT_S'])
+    except (KeyError, ValueError):
+        return None
+    return start_epoch + agent_timeout_s + release_wait_s
+
+
+def start_release_deadline_watchdog(deadline_epoch: float) -> None:
+    """Exit the process with the shell timeout code at deadline_epoch.
+
+    os._exit mirrors the cold-path kill: no output and no cleanup.
+    """
+
+    def expire() -> None:
+        print(
+            f'prewarm agent budget reached, exit {PREWARM_TIMEOUT_EXIT_CODE}',
+            flush=True,
+        )
+        os._exit(PREWARM_TIMEOUT_EXIT_CODE)
+
+    delay_s = deadline_epoch - time.time()
+    if delay_s <= 0:
+        expire()
+        return
+    watchdog = threading.Timer(delay_s, expire)
+    watchdog.daemon = True
+    watchdog.start()
 
 
 ########################################
@@ -1744,12 +1793,28 @@ def process_instance(
 
         # Prewarm: NeMo Gym started this rollout ahead of its dispatch. The runtime is ready,
         # so hold here, before the first model call, until Gym releases or cancels it.
+        # The runtime is created, connected and initialized above, so it sits idle for the
+        # hold. Its idle timeouts are not verified for a hold up to the Gym prewarm TTL.
+        # The LLM client does not exist yet: run_controller creates it after the hold.
         release_signal_fpath = os.environ.get('OH_RELEASE_SIGNAL_FILE')
         if release_signal_fpath:
-            released, wait_s = wait_for_release_signal(release_signal_fpath)
+            outcome, wait_s = wait_for_release_signal(release_signal_fpath)
             update_metrics({'release_wait_time': wait_s})
-            print(f'release wait: {wait_s} seconds (released={released})', flush=True)
-            if not released:
+            print(f'release wait: {wait_s} seconds (outcome={outcome})', flush=True)
+            if outcome == 'shutdown':
+                # SystemExit passes the retry wrapper and the finally block closes the runtime.
+                raise SystemExit(PREWARM_SHUTDOWN_EXIT_CODE)
+            if outcome == 'release':
+                deadline_epoch = release_deadline_epoch(os.environ, wait_s)
+                if deadline_epoch is None:
+                    print(
+                        'prewarm agent budget not set (OH_TIMEOUT_START_EPOCH, OH_AGENT_TIMEOUT_S), '
+                        'the outer shell timeout applies',
+                        flush=True,
+                    )
+                else:
+                    start_release_deadline_watchdog(deadline_epoch)
+            else:
                 # Return, not raise: the retry wrapper in shared.py would rebuild the runtime.
                 return EvalOutput(
                     instance_id=instance.instance_id,
