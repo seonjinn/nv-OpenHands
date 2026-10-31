@@ -69,7 +69,7 @@ from openhands.events.observation import (
 from openhands.events.serialization.event import event_from_dict, event_to_dict
 from openhands.runtime.base import Runtime
 from openhands.utils.async_utils import call_async_from_sync
-from openhands.utils.shutdown_listener import sleep_if_should_continue
+from openhands.utils.shutdown_listener import should_continue, sleep_if_should_continue
 from evaluation.benchmarks.swe_bench.replay_utils import messages_to_replay_events  # noqa: E402
 
 USE_HINT_TEXT = os.environ.get('USE_HINT_TEXT', 'false').lower() == 'true'
@@ -164,6 +164,28 @@ def update_metrics(update_dict: Dict[str, Any]) -> None:
 
     with open(metrics_fpath, "w") as f:
         json.dump(existing_dict | update_dict, f)
+
+
+RELEASE_SIGNAL_POLL_S = 0.5
+
+
+def wait_for_release_signal(signal_fpath: str) -> tuple[bool, float]:
+    """Hold a prewarmed rollout until NeMo Gym releases or cancels it.
+
+    Gym writes "release" or "cancel" atomically. A missing file means keep waiting.
+    A shutdown signal counts as cancel. Returns (released, wait_s).
+    """
+    start_time = time.perf_counter()
+    while should_continue():
+        try:
+            with open(signal_fpath) as f:
+                signal = f.read().strip()
+        except FileNotFoundError:
+            signal = ''
+        if signal in ('release', 'cancel'):
+            return signal == 'release', time.perf_counter() - start_time
+        time.sleep(RELEASE_SIGNAL_POLL_S)
+    return False, time.perf_counter() - start_time
 
 
 ########################################
@@ -1719,6 +1741,30 @@ def process_instance(
             logger.info(
                 f'Replay mode: replaying {len(replay_events)} events for {instance.instance_id}'
             )
+
+        # Prewarm: NeMo Gym started this rollout ahead of its dispatch. The runtime is ready,
+        # so hold here, before the first model call, until Gym releases or cancels it.
+        release_signal_fpath = os.environ.get('OH_RELEASE_SIGNAL_FILE')
+        if release_signal_fpath:
+            released, wait_s = wait_for_release_signal(release_signal_fpath)
+            update_metrics({'release_wait_time': wait_s})
+            print(f'release wait: {wait_s} seconds (released={released})', flush=True)
+            if not released:
+                # Return, not raise: the retry wrapper in shared.py would rebuild the runtime.
+                return EvalOutput(
+                    instance_id=instance.instance_id,
+                    instruction='',
+                    instance=instance.to_dict(),
+                    test_result={
+                        'git_patch': '',
+                        'skipped': True,
+                        'skip_reason': 'prewarm_canceled',
+                    },
+                    metadata=metadata,
+                    history=[],
+                    metrics={},
+                    error=None,
+                )
 
         # Here's how you can run the agent (similar to the `main` function) and get the final task state
         start_time = time.perf_counter()
